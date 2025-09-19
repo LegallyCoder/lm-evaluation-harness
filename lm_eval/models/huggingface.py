@@ -1512,81 +1512,130 @@ class HFLM(TemplateLM):
         pbar.close()
 
         return res
-
-    # EN HIZLI VERSİYON - tüm optimizasyonlar
+    
+        # EN HIZLI VERSİYON - tüm optimizasyonlar
     def _embedding_based_generate(
         self,
         context: torch.Tensor,
         attention_mask: torch.Tensor | None,
         max_length: int,
     ) -> torch.Tensor:
+        assert self.backend == "causal", "Embedding-based decoding şimdilik sadece decoder-only modellerde destekleniyor."
         
         device = self.device
         input_ids = context.to(device, non_blocking=True)
         
         if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, device=device, dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids, device=device)
         else:
             attention_mask = attention_mask.to(device, non_blocking=True)
     
-        # Önceden hesaplamalar
-        emb_matrix = self.model.get_input_embeddings().weight
-        emb_norm = F.normalize(emb_matrix, dim=1).t().contiguous()  # [H, V] - contiguos memory
-        eos_id = self.tokenizer.eos_token_id or -1
+        # Önceden hesaplanmış değerleri cache'le
+        if not hasattr(self, '_cached_emb_norm'):
+            emb_matrix = self.model.get_input_embeddings().weight
+            self._cached_emb_norm = F.normalize(emb_matrix, dim=1).t().contiguous().to(device)
+        
+        emb_norm = self._cached_emb_norm
+        eos_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else -1
         
         total_steps = max(0, max_length - input_ids.shape[1])
         if total_steps == 0:
             return input_ids
     
+        # Top-k approximation için parametreler
+        top_k = 512  # Cache-friendly boyut
+        batch_size = input_ids.size(0)
+        
         with torch.inference_mode(), torch.autocast(
             device_type=device.type,
-            dtype=torch.float16 if self.mixed_precision_dtype is None else self.mixed_precision_dtype,
+            dtype=torch.float16,
             enabled=True,
         ):
-            batch_size = input_ids.size(0)
-            all_eos = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            # KV cache ve diğer state'ler
             past_key_values = None
-    
+            all_eos = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            
             for step in range(total_steps):
                 if all_eos.all():
                     break
     
-                # Model forward
+                # Sadece aktif olmayan sequence'leri işle
+                active_mask = ~all_eos
+                if not active_mask.any():
+                    break
+                    
+                # Model forward - sadece aktif olanlar ve son token
+                if past_key_values is not None:
+                    model_inputs = input_ids[active_mask, -1:]
+                    model_attention = attention_mask[active_mask]
+                else:
+                    model_inputs = input_ids[active_mask]
+                    model_attention = attention_mask[active_mask]
+    
                 outputs = self.model(
-                    input_ids=input_ids[:, -1:] if past_key_values is not None else input_ids,
-                    attention_mask=attention_mask,
+                    input_ids=model_inputs,
+                    attention_mask=model_attention,
                     past_key_values=past_key_values,
                     use_cache=True
                 )
                 
-                past_key_values = outputs.past_key_values
-                logits = outputs.logits[:, -1, :]  # [B, V]
+                # KV cache'i güncelle
+                if past_key_values is None:
+                    past_key_values = outputs.past_key_values
+                else:
+                    # Sadece aktif olanlar için cache'i güncelle
+                    new_past_key_values = []
+                    for i in range(len(past_key_values)):
+                        # Aktif olmayanlar için eski cache'i, aktifler için yeni cache'i kullan
+                        new_cache = []
+                        for j in range(len(past_key_values[i])):
+                            old_cache = past_key_values[i][j]
+                            new_cache_j = torch.zeros_like(old_cache)
+                            new_cache_j[active_mask] = outputs.past_key_values[i][j]
+                            new_cache_j[~active_mask] = old_cache[~active_mask]
+                            new_cache.append(new_cache_j)
+                        new_past_key_values.append(tuple(new_cache))
+                    past_key_values = tuple(new_past_key_values)
     
-                # Optimize edilmiş hesaplamalar
-                probs = F.softmax(logits, dim=-1)
-                pred_emb = torch.mm(probs, emb_matrix)  # [B, H]
-                pred_emb_norm = F.normalize(pred_emb, dim=1, eps=1e-7)
+                # Logits'leri al ve top-k approximation uygula
+                logits = outputs.logits[:, -1, :]  # [Active_B, V]
+                topk_probs, topk_indices = torch.topk(F.softmax(logits, dim=-1), k=top_k, dim=-1)
                 
-                # En hızlı cosine similarity
-                sims = torch.mm(pred_emb_norm, emb_norm)  # [B, V]
-                next_token_ids = torch.argmax(sims, dim=-1, keepdim=True)  # [B, 1]
-    
-                # EOS kontrolü ve güncelleme
+                # Top-k embedding'lerini al
+                topk_embeddings = self.model.get_input_embeddings()(topk_indices)  # [Active_B, k, H]
+                
+                # Weighted average hesapla
+                pred_emb = (topk_probs.unsqueeze(-1) * topk_embeddings).sum(dim=1)  # [Active_B, H]
+                
+                # Cosine similarity'yi hesapla (sadece top-k embedding'leri ile)
+                pred_emb_norm = F.normalize(pred_emb, dim=1, eps=1e-7)
+                topk_emb_norm = F.normalize(topk_embeddings, dim=2)  # [Active_B, k, H]
+                
+                # Matmul yerine einsum kullanarak batch-wise cosine similarity
+                sims = torch.einsum('bh,bkh->bk', pred_emb_norm, topk_emb_norm)  # [Active_B, k]
+                
+                # En benzer token'ı seç
+                topk_max_indices = sims.argmax(dim=-1)  # [Active_B]
+                next_token_ids = topk_indices[torch.arange(active_mask.sum()), topk_max_indices]  # [Active_B]
+                
+                # EOS kontrolü
                 if eos_id != -1:
-                    eos_mask = (next_token_ids.squeeze(1) == eos_id)
-                    all_eos |= eos_mask
-    
-                input_ids = torch.cat([input_ids, next_token_ids], dim=1)
+                    eos_mask = (next_token_ids == eos_id)
+                    all_eos[active_mask] = eos_mask
+                
+                # Sonuçları güncelle
+                final_next_tokens = torch.full((batch_size,), self.tokenizer.pad_token_id or 0, 
+                                             device=device, dtype=input_ids.dtype)
+                final_next_tokens[active_mask] = next_token_ids
+                final_next_tokens = final_next_tokens.unsqueeze(1)
+                
+                input_ids = torch.cat([input_ids, final_next_tokens], dim=1)
                 attention_mask = torch.cat([
                     attention_mask, 
                     (~all_eos).unsqueeze(1).to(attention_mask.dtype)
                 ], dim=1)
     
-                if all_eos.all():
-                    break
-    
         return input_ids
-
 
     def apply_chat_template(
         self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True
