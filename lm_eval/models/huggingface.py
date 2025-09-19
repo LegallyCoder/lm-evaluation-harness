@@ -107,6 +107,8 @@ class HFLM(TemplateLM):
     ) -> None:
         super().__init__()
         # optionally: take in an already-initialized transformers.PreTrainedModel
+        self.custom_decoding = kwargs.pop("custom_decoding", None)  # None veya "embedding"
+
         if not isinstance(pretrained, str):
             eval_logger.warning(
                 "`pretrained` model kwarg is not of type `str`. Many other model arguments may be ignored. Please do not launch via accelerate or use `parallelize=True` if passing an existing model this way."
@@ -964,6 +966,16 @@ class HFLM(TemplateLM):
         stop: list[str],
         **generation_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        # Özel embedding-based decoding
+        decoding_from_gen_kwargs = generation_kwargs.pop("decoding_strategy", None)
+        if (getattr(self, "custom_decoding", None) == "embedding") or (decoding_from_gen_kwargs == "embedding"):
+            attention_mask = generation_kwargs.pop("attention_mask", None)
+            return self._embedding_based_generate(
+                context=context,
+                attention_mask=attention_mask,
+                max_length=max_length,
+            )
+
         # temperature = 0.0 if not set
         # if do_sample is false and temp==0.0:
         # remove temperature, as do_sample=False takes care of this
@@ -1500,6 +1512,81 @@ class HFLM(TemplateLM):
         pbar.close()
 
         return res
+
+    # EN HIZLI VERSİYON - tüm optimizasyonlar
+    def _embedding_based_generate(
+        self,
+        context: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        max_length: int,
+    ) -> torch.Tensor:
+        
+        device = self.device
+        input_ids = context.to(device, non_blocking=True)
+        
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, device=device, dtype=torch.long)
+        else:
+            attention_mask = attention_mask.to(device, non_blocking=True)
+    
+        # Önceden hesaplamalar
+        emb_matrix = self.model.get_input_embeddings().weight
+        emb_norm = F.normalize(emb_matrix, dim=1).t().contiguous()  # [H, V] - contiguos memory
+        eos_id = self.tokenizer.eos_token_id or -1
+        
+        total_steps = max(0, max_length - input_ids.shape[1])
+        if total_steps == 0:
+            return input_ids
+    
+        with torch.inference_mode(), torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16 if self.mixed_precision_dtype is None else self.mixed_precision_dtype,
+            enabled=True,
+        ):
+            batch_size = input_ids.size(0)
+            all_eos = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            past_key_values = None
+    
+            for step in range(total_steps):
+                if all_eos.all():
+                    break
+    
+                # Model forward
+                outputs = self.model(
+                    input_ids=input_ids[:, -1:] if past_key_values is not None else input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+                
+                past_key_values = outputs.past_key_values
+                logits = outputs.logits[:, -1, :]  # [B, V]
+    
+                # Optimize edilmiş hesaplamalar
+                probs = F.softmax(logits, dim=-1)
+                pred_emb = torch.mm(probs, emb_matrix)  # [B, H]
+                pred_emb_norm = F.normalize(pred_emb, dim=1, eps=1e-7)
+                
+                # En hızlı cosine similarity
+                sims = torch.mm(pred_emb_norm, emb_norm)  # [B, V]
+                next_token_ids = torch.argmax(sims, dim=-1, keepdim=True)  # [B, 1]
+    
+                # EOS kontrolü ve güncelleme
+                if eos_id != -1:
+                    eos_mask = (next_token_ids.squeeze(1) == eos_id)
+                    all_eos |= eos_mask
+    
+                input_ids = torch.cat([input_ids, next_token_ids], dim=1)
+                attention_mask = torch.cat([
+                    attention_mask, 
+                    (~all_eos).unsqueeze(1).to(attention_mask.dtype)
+                ], dim=1)
+    
+                if all_eos.all():
+                    break
+    
+        return input_ids
+
 
     def apply_chat_template(
         self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True
